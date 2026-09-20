@@ -79,6 +79,7 @@ from app.scheduler.cron import (
 from app.scheduler.email_sync import sync_all_email_accounts
 from app.scheduler.task_queue import task_queue_scheduler
 from app.telemetry_events import TelemetryEvent
+from app.uploads import UploadBodyLimitMiddleware
 from app.version import get_version
 from app.workspace.knowledge_sync import knowledge_sync
 from app.workspace.manager import workspace_manager
@@ -266,6 +267,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title='Vibe Seller', version=get_version(), lifespan=lifespan)
 
+# Order matters. add_middleware inserts at the front of the list, so
+# the LAST one registered is the OUTERMOST. CORS must wrap the body
+# limit: a 413 emitted outside CORS reaches a cross-origin caller as
+# an opaque network error rather than a readable status.
+app.add_middleware(UploadBodyLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -279,6 +285,7 @@ app.add_middleware(
     allow_methods=['*'],
     allow_headers=['*'],
 )
+
 
 # Routers
 app.include_router(auth_router)
