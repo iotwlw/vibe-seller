@@ -1,7 +1,47 @@
-import { useRef, useCallback, useState, type DragEvent, type ClipboardEvent } from 'react'
+import { useRef, useCallback, useState, type DragEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { PendingFile, Store } from '../types'
+import { usePasteFiles } from '../hooks/usePasteFiles'
 import { uuid } from '../uuid'
+
+/** Kept in sync with the file input's `accept` and the hint text. */
+const ACCEPTED_TYPES = [
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
+]
+const MAX_FILE_SIZE = 10 * 1024 * 1024
+const EXT_BY_TYPE: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+  'application/pdf': 'pdf',
+}
+
+/** Give a nameless clipboard file a real name.
+ *
+ *  The upload sends `PendingFile.file`, and the server derives the
+ *  stored extension from `File.name` alone
+ *  (`app/routers/attachments.py`) — a blank name lands in the agent's
+ *  cwd as `uploads/upload.bin`, so the screenshot the user pasted no
+ *  longer reads as an image. A display-only label cannot fix that: it
+ *  never reaches the wire. Rename the File itself and let the label
+ *  derive from it, so what is shown and what is uploaded cannot drift
+ *  apart. ASCII on purpose — the server strips anything else out of
+ *  the stem. */
+function withFilename(file: File): File {
+  if (file.name) return file
+  return new File([file], `pasted.${EXT_BY_TYPE[file.type]}`, {
+    type: file.type,
+    lastModified: file.lastModified,
+  })
+}
+
+/** True when a drag carries files. `dataTransfer.files` is empty
+ *  during dragover for security reasons, so `types` is the only
+ *  signal available that early. */
+function dragHasFiles(e: DragEvent): boolean {
+  return Array.from(e.dataTransfer?.types ?? []).includes('Files')
+}
 
 interface CreateTaskModalProps {
   showAllTasks: boolean
@@ -20,16 +60,31 @@ export function CreateTaskModal({ showAllTasks, storeName, selectedStore, onClos
   const [selectedPlatform, setSelectedPlatform] = useState('')
   const [selectedCountry, setSelectedCountry] = useState('')
   const [dragOver, setDragOver] = useState(false)
+  /** Why the last batch of files did not all make it in. Silent
+   *  skipping reads as "attachments are broken" — the user has no way
+   *  to tell a rejected file from a dead drop zone. */
+  const [rejected, setRejected] = useState<string[]>([])
   const fileInputRef = useRef<HTMLInputElement>(null)
   const titleInputRef = useRef<HTMLInputElement>(null)
 
   const addFiles = useCallback((files: FileList | File[]) => {
-    const allowed = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf']
-    const maxSize = 10 * 1024 * 1024
     const newPending: PendingFile[] = []
-    for (const file of Array.from(files)) {
-      if (!allowed.includes(file.type)) continue
-      if (file.size > maxSize) continue
+    const skipped: string[] = []
+    for (const original of Array.from(files)) {
+      // A pasted screenshot can arrive nameless; say something about
+      // it rather than opening the complaint with an empty string.
+      const label = original.name || t('tasks.attachmentClipboardItem')
+      if (!ACCEPTED_TYPES.includes(original.type)) {
+        skipped.push(t('tasks.attachmentUnsupported', { name: label }))
+        continue
+      }
+      if (original.size > MAX_FILE_SIZE) {
+        skipped.push(t('tasks.attachmentTooLarge', { name: label }))
+        continue
+      }
+      // Accepted, so the type is one `withFilename` has an extension
+      // for. Name it before staging: `file.name` is what gets uploaded.
+      const file = withFilename(original)
       newPending.push({
         id: uuid(),
         file,
@@ -38,7 +93,13 @@ export function CreateTaskModal({ showAllTasks, storeName, selectedStore, onClos
       })
     }
     setModalFiles(prev => [...prev, ...newPending])
-  }, [])
+    setRejected(skipped)
+  }, [t])
+
+  // Ctrl/Cmd+V anywhere in the dialog — including right after clicking
+  // the drop zone, which leaves focus on `document.body` and so never
+  // reaches a React `onPaste`. See `usePasteFiles`.
+  usePasteFiles(addFiles)
 
   const removeFile = (id: string) => {
     setModalFiles(prev => {
@@ -48,25 +109,32 @@ export function CreateTaskModal({ showAllTasks, storeName, selectedStore, onClos
     })
   }
 
-  const handleDragOver = (e: DragEvent) => { e.preventDefault(); setDragOver(true) }
+  const handleDragOver = (e: DragEvent) => {
+    if (!dragHasFiles(e)) return
+    e.preventDefault()
+    setDragOver(true)
+  }
   const handleDragLeave = (e: DragEvent) => { e.preventDefault(); setDragOver(false) }
   const handleDrop = (e: DragEvent) => {
-    e.preventDefault()
     setDragOver(false)
-    if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files)
+    if (!e.dataTransfer.files.length) return
+    e.preventDefault()
+    // The dialog-wide guard below would otherwise attach it twice.
+    e.stopPropagation()
+    addFiles(e.dataTransfer.files)
   }
 
-  const handlePaste = (e: ClipboardEvent) => {
-    const items = e.clipboardData?.items
-    if (!items) return
-    const files: File[] = []
-    for (const item of Array.from(items)) {
-      if (item.kind === 'file') {
-        const f = item.getAsFile()
-        if (f) files.push(f)
-      }
-    }
-    if (files.length) addFiles(files)
+  /** A file dropped anywhere else over the open dialog. Without this
+   *  the browser navigates the tab to the dropped file and the
+   *  half-typed task is gone, so a near-miss attaches instead.
+   *
+   *  Files only. Cancelling every drop would also cancel dragging
+   *  selected text into the title or description, which the browser
+   *  handles natively and which this dialog has no business eating. */
+  const handleDialogDrop = (e: DragEvent) => {
+    if (!e.dataTransfer.files.length) return
+    e.preventDefault()
+    addFiles(e.dataTransfer.files)
   }
 
   const handleClose = () => {
@@ -89,7 +157,8 @@ export function CreateTaskModal({ showAllTasks, storeName, selectedStore, onClos
     <div
       className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40"
       onClick={(e) => { if (e.target === e.currentTarget) handleClose() }}
-      onPaste={handlePaste}
+      onDragOver={(e) => { if (dragHasFiles(e)) e.preventDefault() }}
+      onDrop={handleDialogDrop}
     >
       <div className="bg-white rounded-t-2xl sm:rounded-xl shadow-2xl w-full sm:max-w-lg sm:mx-4 max-h-[92vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
         <div className="px-6 py-4 border-b border-gray-200">
@@ -159,7 +228,7 @@ export function CreateTaskModal({ showAllTasks, storeName, selectedStore, onClos
             </div>
           )}
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Attachments <span className="text-gray-400 font-normal">(optional)</span></label>
+            <label className="block text-sm font-medium text-gray-700 mb-1">{t('tasks.attachmentsLabel')} <span className="text-gray-400 font-normal">({t('common.optional')})</span></label>
             <div
               onDragOver={handleDragOver}
               onDragLeave={handleDragLeave}
@@ -169,8 +238,8 @@ export function CreateTaskModal({ showAllTasks, storeName, selectedStore, onClos
                 dragOver ? 'border-indigo-500 bg-indigo-50' : 'border-gray-300 hover:border-gray-400'
               }`}
             >
-              <p className="text-sm text-gray-500">Drop images here, paste, or click to browse</p>
-              <p className="text-xs text-gray-400 mt-1">PNG, JPEG, GIF, WebP, PDF up to 10MB</p>
+              <p className="text-sm text-gray-500">{t('tasks.attachmentsHint')}</p>
+              <p className="text-xs text-gray-400 mt-1">{t('tasks.attachmentsTypes')}</p>
               <input
                 ref={fileInputRef}
                 type="file"
@@ -180,6 +249,13 @@ export function CreateTaskModal({ showAllTasks, storeName, selectedStore, onClos
                 onChange={e => { if (e.target.files?.length) addFiles(e.target.files); e.target.value = '' }}
               />
             </div>
+            {rejected.length > 0 && (
+              <ul className="mt-2 space-y-0.5" data-testid="attachment-rejected">
+                {rejected.map((msg, i) => (
+                  <li key={i} className="text-xs text-red-600">{msg}</li>
+                ))}
+              </ul>
+            )}
             {modalFiles.length > 0 && (
               <div className="flex flex-wrap gap-2 mt-3">
                 {modalFiles.map(pf => (
