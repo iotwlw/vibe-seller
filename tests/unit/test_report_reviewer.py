@@ -262,3 +262,112 @@ class TestTurnRollover:
         exec_r.write_text('Status: ok\n', encoding='utf-8')
         rr.rollover_reviews(tmp_path)
         assert not exec_r.exists()
+
+
+@pytest.mark.unit
+class TestSkillDodAddendum:
+    """The skill's own ``review:`` contract must reach the reviewer.
+
+    ``skill_review.parse_skill_review`` has always parsed ``criteria``
+    and ``verify_by``, but the gate used only "is a review block
+    present?" — so the agent being reviewed also authored the reviewer's
+    standard. A noon listing task whose skill demanded "the SKU is
+    ACTUALLY created and live" spawned a reviewer told only to re-read
+    the import row's counters; it signed off on an import that created
+    nothing. The contract now rides in the deny text.
+    """
+
+    class _Review:
+        def __init__(self, criteria='', verify_by=''):
+            self.criteria = criteria
+            self.verify_by = verify_by
+
+    def test_empty_when_no_skills_declare_review(self):
+        assert rr.skill_dod_addendum(None) == ''
+        assert rr.skill_dod_addendum({}) == ''
+
+    def test_empty_when_block_carries_no_text(self):
+        assert rr.skill_dod_addendum({'s': self._Review()}) == ''
+
+    def test_renders_criteria_and_verify_by(self):
+        out = rr.skill_dod_addendum({
+            'noon-listing': self._Review('ACTUALLY created', 'Open the page')
+        })
+        assert 'noon-listing' in out
+        assert 'ACTUALLY created' in out
+        assert 'Open the page' in out
+        assert 'verbatim' in out
+
+    def test_is_deterministic_across_several_skills(self):
+        reviews = {
+            'b-skill': self._Review('bee'),
+            'a-skill': self._Review('ay'),
+        }
+        out = rr.skill_dod_addendum(reviews)
+        assert out.index('a-skill') < out.index('b-skill')
+
+    def test_deny_text_carries_the_contract(self, tmp_path):
+        deny = rr.reviewer_verdict(
+            tmp_path,
+            skill_reviews={
+                'noon-listing': self._Review(
+                    'the SKU is ACTUALLY created',
+                    "Open the created SKU's catalog page",
+                )
+            },
+        )
+        assert deny is not None
+        assert 'Reviewer never ran' in deny
+        assert 'the SKU is ACTUALLY created' in deny
+        assert "Open the created SKU's catalog page" in deny
+
+    def test_deny_text_unchanged_without_contract(self, tmp_path):
+        deny = rr.reviewer_verdict(tmp_path)
+        assert deny is not None
+        assert 'Reviewer never ran' in deny
+        assert 'Definition of Done declared by skill' not in deny
+
+    def test_retry_denials_also_carry_the_contract(self, tmp_path):
+        # The contract matters MOST on a retry: that is when the agent
+        # re-launches the reviewer and could hand it a narrower
+        # checklist again. Appending only to the "never ran" branch left
+        # every retry path bare.
+        (tmp_path / 'REVIEW_2026-09-15_iter1.md').write_text(
+            'Status: gaps\n', encoding='utf-8'
+        )
+        deny = rr.reviewer_verdict(
+            tmp_path,
+            skill_reviews={
+                'noon-listing': self._Review(
+                    'the SKU is ACTUALLY created', 'Open the page'
+                )
+            },
+        )
+        assert deny is not None
+        assert 'found gaps' in deny
+        assert 'the SKU is ACTUALLY created' in deny
+
+    def test_untrusted_verdict_denial_carries_the_contract(self, tmp_path):
+        (tmp_path / 'REVIEW_2026-09-15_iter1.md').write_text(
+            'Status: ok\n', encoding='utf-8'
+        )
+        deny = rr.reviewer_verdict(
+            tmp_path,
+            review_writers={'REVIEW_2026-09-15_iter1.md': 'main'},
+            skill_reviews={'s': self._Review('ACTUALLY created')},
+        )
+        assert deny is not None
+        assert 'ACTUALLY created' in deny
+
+    def test_accepting_verdict_returns_none_not_an_addendum(self, tmp_path):
+        (tmp_path / 'REVIEW_2026-09-15_iter1.md').write_text(
+            'Status: ok\n', encoding='utf-8'
+        )
+        assert (
+            rr.reviewer_verdict(
+                tmp_path,
+                review_writers={'REVIEW_2026-09-15_iter1.md': 'subagent'},
+                skill_reviews={'s': self._Review('ACTUALLY created')},
+            )
+            is None
+        )
